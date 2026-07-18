@@ -72,16 +72,84 @@ constexpr u64 NODES_LIMIT_OUTPUT = 10'000'000;
 constexpr int SEARCHEDLIST_CAPACITY = 32;
 using SearchedList                  = ValueList<Move, SEARCHEDLIST_CAPACITY>;
 
-constexpr usize AGGRESSION_PV_PLIES = 8;
+constexpr usize AGGRESSION_PV_PLIES    = 32;
+constexpr int   AGGRESSION_RISK_START_CP = 200;
+constexpr int   AGGRESSION_RISK_FULL_CP  = 600;
+constexpr int   AGGRESSION_RISK_DROP_CP  = 150;
 
 int material_value(const Position& pos, Color c) {
     return PawnValue * pos.count<PAWN>(c) + pos.non_pawn_material(c);
 }
 
+int root_move_investment(const Position& pos, Move move) {
+    if (pos.see_ge(move, VALUE_ZERO))
+        return 0;
+
+    int lower = -QueenValue;
+    int upper = 0;
+    if (!pos.see_ge(move, lower))
+        return QueenValue;
+
+    // SEE is monotonic in the threshold. Recover its negative value closely enough
+    // to compare the amount of material deliberately offered by root candidates.
+    while (lower + 1 < upper)
+    {
+        const int threshold = lower + (upper - lower) / 2;
+        if (pos.see_ge(move, threshold))
+            lower = threshold;
+        else
+            upper = threshold;
+    }
+
+    return -lower;
+}
+
+int positional_pressure(const Position& pos, Color engine) {
+    const Color them = ~engine;
+
+    const Bitboard attacks = pos.attacks_by<PAWN>(engine) | pos.attacks_by<KNIGHT>(engine)
+                           | pos.attacks_by<BISHOP>(engine) | pos.attacks_by<ROOK>(engine)
+                           | pos.attacks_by<QUEEN>(engine) | pos.attacks_by<KING>(engine);
+    Bitboard kingZone =
+      Attacks::attacks_bb<KING>(pos.square<KING>(them)) | pos.square<KING>(them);
+    Bitboard kingAttackers = 0;
+    Bitboard zoneSquares   = kingZone;
+    while (zoneSquares)
+    {
+        const Square square = pop_lsb(zoneSquares);
+        kingAttackers |= pos.attackers_to(square) & pos.pieces(engine);
+    }
+
+    const Bitboard enemyHalf = engine == WHITE ? Rank5BB | Rank6BB | Rank7BB | Rank8BB
+                                               : Rank1BB | Rank2BB | Rank3BB | Rank4BB;
+    const Bitboard activePieces = pos.pieces(engine, KNIGHT, BISHOP, ROOK, QUEEN, KING);
+    constexpr Bitboard center =
+      square_bb(SQ_D4) | SQ_E4 | SQ_D5 | SQ_E5;
+
+    int      advancedPawnPressure = 0;
+    Bitboard pawns                = pos.pieces(engine, PAWN);
+    while (pawns)
+        advancedPawnPressure +=
+          std::max(0, int(relative_rank(engine, pop_lsb(pawns))) - int(RANK_3));
+
+    return 8 * popcount(attacks & kingZone)
+         + 6 * popcount(kingAttackers & ~pos.pieces(engine, PAWN, KING))
+         + 2 * popcount(attacks & enemyHalf & ~pos.pieces(engine))
+         + 3 * popcount(activePieces & enemyHalf) + 4 * popcount(attacks & center)
+         + 3 * advancedPawnPressure;
+}
+
 struct AggressionMetrics {
-    int  peakInvestment          = 0;
-    int  balancedNonPawnExchange = 0;
-    bool engineGaveCheck         = false;
+    int peakInvestment          = 0;
+    int persistentInvestment    = 0;
+    int investmentSum           = 0;
+    int checkingInvestment      = 0;
+    int peakPressureGain        = 0;
+    int persistentPressureGain  = 0;
+    int pressureGainSum         = 0;
+    int balancedMaterialExchange = 0;
+    int balancedNonPawnExchange  = 0;
+    int engineSamples           = 0;
 };
 
 bool analyze_aggression_pv(const Position& rootPos,
@@ -103,22 +171,52 @@ bool analyze_aggression_pv(const Position& rootPos,
 
     std::array<StateInfo, AGGRESSION_PV_PLIES> states;
     const usize plies = std::min(AGGRESSION_PV_PLIES, pv.size());
+    const int   initialPressure = positional_pressure(pos, engine);
+    int         lastEngineCheckPly = -3;
 
     for (usize ply = 0; ply < plies; ++ply)
     {
-        const Move move = pv[ply];
+        const Move move       = pv[ply];
+        const bool engineMove = pos.side_to_move() == engine;
 
         if (!move.is_ok() || !pos.pseudo_legal(move) || !pos.legal(move))
             return false;
 
-        if (pos.side_to_move() == engine && pos.gives_check(move))
-            metrics.engineGaveCheck = true;
+        if (engineMove && pos.gives_check(move))
+            lastEngineCheckPly = int(ply);
 
         pos.do_move(move, states[ply]);
 
-        const int engineLoss = std::max(0, initialEngineMaterial - material_value(pos, engine));
-        const int enemyLoss  = std::max(0, initialEnemyMaterial - material_value(pos, them));
-        metrics.peakInvestment = std::max(metrics.peakInvestment, engineLoss - enemyLoss);
+        // Only confirm an investment after the engine has had a move to answer the
+        // opponent's capture. This avoids treating a truncated PV as a sacrifice.
+        if (engineMove)
+        {
+            const int engineLoss =
+              std::max(0, initialEngineMaterial - material_value(pos, engine));
+            const int enemyLoss =
+              std::max(0, initialEnemyMaterial - material_value(pos, them));
+            const int investment = std::max(0, engineLoss - enemyLoss);
+            const int pressureGain =
+              std::max(0, positional_pressure(pos, engine) - initialPressure);
+
+            const int sharedMaterialLoss = std::min(engineLoss, enemyLoss);
+            const int materialLossGap     = std::abs(engineLoss - enemyLoss);
+            metrics.balancedMaterialExchange =
+              std::max(metrics.balancedMaterialExchange,
+                       std::max(0, sharedMaterialLoss - 2 * materialLossGap));
+
+            metrics.peakInvestment       = std::max(metrics.peakInvestment, investment);
+            metrics.persistentInvestment = investment;
+            if (int(ply) - lastEngineCheckPly <= 2)
+                metrics.checkingInvestment =
+                  std::max(metrics.checkingInvestment, investment);
+            metrics.investmentSum += investment;
+            metrics.peakPressureGain =
+              std::max(metrics.peakPressureGain, pressureGain);
+            metrics.persistentPressureGain = pressureGain;
+            metrics.pressureGainSum += pressureGain;
+            ++metrics.engineSamples;
+        }
 
         const int engineNonPawnLoss =
           std::max(0, initialEngineNonPawn - pos.non_pawn_material(engine));
@@ -184,16 +282,65 @@ Move select_aggressive_move(const Position& rootPos,
         if (!analyze_aggression_pv(rootPos, rootMove.pv, metrics))
             continue;
 
-        // A forcing sacrifice receives its full temporary material investment.
-        // Speculative material loss without a check keeps only one fifth of it.
-        int aggressionScore = metrics.engineGaveCheck ? metrics.peakInvestment
-                                                      : metrics.peakInvestment / 5;
+        const int averageInvestment =
+          metrics.investmentSum / std::max(1, metrics.engineSamples);
+        const int sustainedInvestment =
+          (2 * metrics.persistentInvestment + averageInvestment) / 3;
+        const int evalDropCp = std::max(0, topScoreCp - scoreCp);
+        const int objectiveDropMaterial = evalDropCp * int(PawnValue) / 100;
+
+        // If a PV remains materially invested deep into the line while retaining
+        // nearly the same objective score, Stockfish's evaluation is recognizing
+        // positional compensation. Reward that support independently of checks.
+        const int positionalSupport =
+          std::max(0, sustainedInvestment - objectiveDropMaterial);
+
+        const int offeredInvestment =
+          root_move_investment(rootPos, rootMove.pv[0]);
+        const int offeredSupport =
+          std::max(0, offeredInvestment - objectiveDropMaterial);
+
+        // Reward pressure that persists across the PV: attacks around the enemy king,
+        // control of the enemy half and center, and active pieces penetrating deeply.
+        const int averagePressure =
+          metrics.pressureGainSum / std::max(1, metrics.engineSamples);
+        const int sustainedPressure =
+          (metrics.peakPressureGain + 2 * metrics.persistentPressureGain
+           + averagePressure)
+          / 4;
+        const int pressureReward = sustainedPressure * int(PawnValue) / 24;
+
+        // Truly unsupported loss keeps only one fifth of its peak value. A checking
+        // sacrifice still receives full credit, as does a deeply sustained sacrifice
+        // whose objective evaluation accounts for the missing material.
+        int aggressionScore =
+          std::max({metrics.peakInvestment / 5, positionalSupport, offeredSupport,
+                    metrics.checkingInvestment})
+          + pressureReward;
+        if (offeredInvestment && rootPos.gives_check(rootMove.pv[0]))
+            aggressionScore = std::max(aggressionScore, offeredInvestment);
+
+        // A large advantage is practical risk budget. Spend up to 1.5 pawns of it,
+        // but only on a move which already has a concrete aggressive feature.
+        constexpr int riskScaleRange = AGGRESSION_RISK_FULL_CP - AGGRESSION_RISK_START_CP;
+        const int riskScale =
+          std::clamp(topScoreCp - AGGRESSION_RISK_START_CP, 0, riskScaleRange);
+        if (aggressionScore > 0)
+        {
+            const int rewardedDropCp = std::min(evalDropCp, AGGRESSION_RISK_DROP_CP);
+            aggressionScore +=
+              rewardedDropCp * int(PawnValue) / 100 * riskScale / riskScaleRange;
+        }
 
         // When objectively worse, exchanging equal non-pawn material generally helps
         // the opponent simplify. Scale that penalty from two to five pawns down.
         const int deficitPastTwoPawns = std::max(0, -topScoreCp - 200);
         const int simplificationScale = std::min(deficitPastTwoPawns, 300);
         aggressionScore -= metrics.balancedNonPawnExchange * simplificationScale / 300;
+
+        // When winning, keep complexity instead of liquidating the advantage.
+        aggressionScore -=
+          metrics.balancedMaterialExchange * riskScale / (2 * riskScaleRange);
 
         if (aggressionScore > bestAggressionScore
             || (aggressionScore == bestAggressionScore
