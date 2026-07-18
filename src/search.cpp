@@ -312,10 +312,17 @@ bool Search::Worker::iterative_deepening() {
     usize multiPV = usize(options["MultiPV"]);
     Skill skill(options["Skill Level"], options["UCI_LimitStrength"] ? int(options["UCI_Elo"]) : 0);
 
+    const bool aggressiveMode = bool(options["Aggressive Mode"]);
+
     // When playing with strength handicap enable MultiPV search that we will
     // use behind-the-scenes to retrieve a set of possible moves.
     if (skill.enabled())
         multiPV = std::max(multiPV, usize(4));
+
+    // Aggressive mode needs several deeply searched root moves so that it can
+    // later choose the most practically dangerous acceptable candidate.
+    if (aggressiveMode)
+        multiPV = std::max(multiPV, usize(options["Aggression Candidates"]));
 
     multiPV = std::min(multiPV, rootMoves.size());
 
