@@ -72,6 +72,142 @@ constexpr u64 NODES_LIMIT_OUTPUT = 10'000'000;
 constexpr int SEARCHEDLIST_CAPACITY = 32;
 using SearchedList                  = ValueList<Move, SEARCHEDLIST_CAPACITY>;
 
+constexpr usize AGGRESSION_PV_PLIES = 8;
+
+int material_value(const Position& pos, Color c) {
+    return PawnValue * pos.count<PAWN>(c) + pos.non_pawn_material(c);
+}
+
+struct AggressionMetrics {
+    int  peakInvestment          = 0;
+    int  balancedNonPawnExchange = 0;
+    bool engineGaveCheck         = false;
+};
+
+bool analyze_aggression_pv(const Position& rootPos,
+                           const PVMoves&  pv,
+                           AggressionMetrics& metrics) {
+    Position  pos;
+    StateInfo rootState;
+
+    if (pos.set(rootPos.fen(), rootPos.is_chess960(), &rootState))
+        return false;
+
+    const Color engine = pos.side_to_move();
+    const Color them   = ~engine;
+
+    const int initialEngineMaterial = material_value(pos, engine);
+    const int initialEnemyMaterial  = material_value(pos, them);
+    const int initialEngineNonPawn  = pos.non_pawn_material(engine);
+    const int initialEnemyNonPawn   = pos.non_pawn_material(them);
+
+    std::array<StateInfo, AGGRESSION_PV_PLIES> states;
+    const usize plies = std::min(AGGRESSION_PV_PLIES, pv.size());
+
+    for (usize ply = 0; ply < plies; ++ply)
+    {
+        const Move move = pv[ply];
+
+        if (!move.is_ok() || !pos.pseudo_legal(move) || !pos.legal(move))
+            return false;
+
+        if (pos.side_to_move() == engine && pos.gives_check(move))
+            metrics.engineGaveCheck = true;
+
+        pos.do_move(move, states[ply]);
+
+        const int engineLoss = std::max(0, initialEngineMaterial - material_value(pos, engine));
+        const int enemyLoss  = std::max(0, initialEnemyMaterial - material_value(pos, them));
+        metrics.peakInvestment = std::max(metrics.peakInvestment, engineLoss - enemyLoss);
+
+        const int engineNonPawnLoss =
+          std::max(0, initialEngineNonPawn - pos.non_pawn_material(engine));
+        const int enemyNonPawnLoss =
+          std::max(0, initialEnemyNonPawn - pos.non_pawn_material(them));
+        const int sharedLoss = std::min(engineNonPawnLoss, enemyNonPawnLoss);
+        const int lossGap    = std::abs(engineNonPawnLoss - enemyNonPawnLoss);
+
+        // Equal minor-for-minor and rook-for-rook trades receive the full amount.
+        // The measure fades to zero once the material lost differs by roughly half.
+        metrics.balancedNonPawnExchange =
+          std::max(metrics.balancedNonPawnExchange, std::max(0, sharedLoss - 2 * lossGap));
+    }
+
+    return true;
+}
+
+Move select_aggressive_move(const Position& rootPos,
+                            const RootMoves& rootMoves,
+                            usize            candidateCount,
+                            int              evalFloor,
+                            int              maxEvalDrop) {
+    const Move stockfishMove = rootMoves[0].pv[0];
+    candidateCount           = std::min(candidateCount, rootMoves.size());
+
+    const Value stockfishScore = rootMoves[0].score;
+    if (stockfishScore != VALUE_NONE && stockfishScore != -VALUE_INFINITE
+        && stockfishScore != VALUE_INFINITE && is_decisive(stockfishScore))
+        return stockfishMove;
+
+    Value topScore = -VALUE_INFINITE;
+    for (usize i = 0; i < candidateCount; ++i)
+    {
+        const RootMove& rootMove = rootMoves[i];
+        if (rootMove.score != VALUE_NONE && rootMove.score != -VALUE_INFINITE
+            && rootMove.score != VALUE_INFINITE && !rootMove.score_is_bound())
+            topScore = std::max(topScore, rootMove.score);
+    }
+
+    if (topScore == -VALUE_INFINITE || is_decisive(topScore))
+        return stockfishMove;
+
+    const int topScoreCp = UCIEngine::to_cp(topScore, rootPos);
+    Move      selected   = stockfishMove;
+    int       bestAggressionScore = -VALUE_INFINITE;
+    Value     bestObjectiveScore  = -VALUE_INFINITE;
+
+    for (usize i = 0; i < candidateCount; ++i)
+    {
+        const RootMove& rootMove = rootMoves[i];
+
+        if (rootMove.pv.empty() || rootMove.score == VALUE_NONE
+            || rootMove.score == -VALUE_INFINITE || rootMove.score == VALUE_INFINITE
+            || rootMove.score_is_bound() || is_loss(rootMove.score))
+            continue;
+
+        const int scoreCp = UCIEngine::to_cp(rootMove.score, rootPos);
+        if ((topScoreCp > evalFloor && scoreCp < evalFloor)
+            || (topScoreCp <= evalFloor && topScoreCp - scoreCp > maxEvalDrop))
+            continue;
+
+        AggressionMetrics metrics;
+        if (!analyze_aggression_pv(rootPos, rootMove.pv, metrics))
+            continue;
+
+        // A forcing sacrifice receives its full temporary material investment.
+        // Speculative material loss without a check keeps only one fifth of it.
+        int aggressionScore = metrics.engineGaveCheck ? metrics.peakInvestment
+                                                      : metrics.peakInvestment / 5;
+
+        // When objectively worse, exchanging equal non-pawn material generally helps
+        // the opponent simplify. Scale that penalty from two to five pawns down.
+        const int deficitPastTwoPawns = std::max(0, -topScoreCp - 200);
+        const int simplificationScale = std::min(deficitPastTwoPawns, 300);
+        aggressionScore -= metrics.balancedNonPawnExchange * simplificationScale / 300;
+
+        if (aggressionScore > bestAggressionScore
+            || (aggressionScore == bestAggressionScore
+                && rootMove.score > bestObjectiveScore))
+        {
+            selected            = rootMove.pv[0];
+            bestAggressionScore = aggressionScore;
+            bestObjectiveScore  = rootMove.score;
+        }
+    }
+
+    return selected;
+}
+
 // (*Scalers):
 // The values with Scaler asterisks have proven non-linear scaling.
 // They are optimized to time controls of 180 + 1.8 and longer,
@@ -239,8 +375,9 @@ void Search::Worker::start_searching() {
     Worker* bestThread = this;
     Skill   skill =
       Skill(options["Skill Level"], options["UCI_LimitStrength"] ? int(options["UCI_Elo"]) : 0);
+    const bool aggressiveMode = bool(options["Aggressive Mode"]);
 
-    if (!limits.depth && !skill.enabled())
+    if (!limits.depth && !skill.enabled() && !aggressiveMode)
         bestThread = threads.get_best_thread()->worker.get();
 
     main_manager()->bestPreviousScore        = bestThread->rootMoves[0].score;
@@ -561,7 +698,7 @@ bool Search::Worker::iterative_deepening() {
             continue;
 
         // If the skill level is enabled and time is up, pick a sub-optimal best move
-        if (skill.enabled() && skill.time_to_pick(rootDepth))
+        if (!aggressiveMode && skill.enabled() && skill.time_to_pick(rootDepth))
             skill.pick_best(rootMoves, multiPV);
 
         // Use part of the gained time from a previous stable move for the current move
@@ -628,8 +765,18 @@ bool Search::Worker::iterative_deepening() {
 
     mainThread->previousTimeReduction = timeReduction;
 
-    // If the skill level is enabled, swap the best PV line with the sub-optimal one
-    if (skill.enabled())
+    // Aggressive mode deliberately takes precedence over Skill Level's random choice.
+    if (aggressiveMode)
+    {
+        Move aggressiveMove = select_aggressive_move(rootPos, rootMoves, multiPV,
+                                                     int(options["Aggression Eval Floor"]),
+                                                     int(options["Aggression Max Eval Drop"]));
+        auto selected = std::find(rootMoves.begin(), rootMoves.end(), aggressiveMove);
+        if (selected != rootMoves.end())
+            std::swap(rootMoves[0], *selected);
+    }
+    // If the skill level is enabled, swap the best PV line with the sub-optimal one.
+    else if (skill.enabled())
         std::swap(rootMoves[0],
                   *std::find(rootMoves.begin(), rootMoves.end(),
                              skill.best ? skill.best : skill.pick_best(rootMoves, multiPV)));
