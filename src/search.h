@@ -264,6 +264,8 @@ struct Skill {
 // keeping track of the time, and storing data strictly related to the main thread.
 class SearchManager: public ISearchManager {
    public:
+    static constexpr usize AggressionPlanLength = 8;
+
     using UpdateShort    = std::function<void(const InfoShort&)>;
     using UpdateFull     = std::function<void(const InfoFull&)>;
     using UpdateIter     = std::function<void(const InfoIteration&)>;
@@ -297,6 +299,9 @@ class SearchManager: public ISearchManager {
     Value                bestPreviousScore;
     Value                bestPreviousAverageScore;
     bool                 stopOnPonderhit;
+
+    std::array<Key, AggressionPlanLength>  aggressionPlanKeys{};
+    std::array<Move, AggressionPlanLength> aggressionPlanMoves{};
 
     const UpdateContext& updates;
 };

@@ -72,10 +72,11 @@ constexpr u64 NODES_LIMIT_OUTPUT = 10'000'000;
 constexpr int SEARCHEDLIST_CAPACITY = 32;
 using SearchedList                  = ValueList<Move, SEARCHEDLIST_CAPACITY>;
 
-constexpr usize AGGRESSION_PV_PLIES    = 32;
+constexpr usize AGGRESSION_PV_PLIES      = 32;
 constexpr int   AGGRESSION_RISK_START_CP = 200;
 constexpr int   AGGRESSION_RISK_FULL_CP  = 600;
 constexpr int   AGGRESSION_RISK_DROP_CP  = 150;
+constexpr int   AGGRESSION_PLAN_BONUS     = 3 * int(PawnValue) / 4;
 
 int material_value(const Position& pos, Color c) {
     return PawnValue * pos.count<PAWN>(c) + pos.non_pawn_material(c);
@@ -136,7 +137,16 @@ int positional_pressure(const Position& pos, Color engine) {
          + 6 * popcount(kingAttackers & ~pos.pieces(engine, PAWN, KING))
          + 2 * popcount(attacks & enemyHalf & ~pos.pieces(engine))
          + 3 * popcount(activePieces & enemyHalf) + 4 * popcount(attacks & center)
+         + popcount(attacks & ~pos.pieces(engine))
+         + 4 * popcount(attacks & pos.pieces(them, KNIGHT, BISHOP, ROOK, QUEEN))
+         + 5 * popcount(pos.blockers_for_king(them) & pos.pieces(them))
          + 3 * advancedPawnPressure;
+}
+
+int positional_style(const Position& pos, Color engine) {
+    // Attacking activity matters much more than the opponent's counterplay, but
+    // pressure which simply opens our own king should not look positionally stylish.
+    return (3 * positional_pressure(pos, engine) - positional_pressure(pos, ~engine)) / 2;
 }
 
 struct AggressionMetrics {
@@ -149,6 +159,8 @@ struct AggressionMetrics {
     int pressureGainSum         = 0;
     int balancedMaterialExchange = 0;
     int balancedNonPawnExchange  = 0;
+    int persistentRestriction    = 0;
+    int restrictionSum           = 0;
     int engineSamples           = 0;
 };
 
@@ -171,7 +183,7 @@ bool analyze_aggression_pv(const Position& rootPos,
 
     std::array<StateInfo, AGGRESSION_PV_PLIES> states;
     const usize plies = std::min(AGGRESSION_PV_PLIES, pv.size());
-    const int   initialPressure = positional_pressure(pos, engine);
+    const int   initialPressure = positional_style(pos, engine);
     int         lastEngineCheckPly = -3;
 
     for (usize ply = 0; ply < plies; ++ply)
@@ -196,8 +208,10 @@ bool analyze_aggression_pv(const Position& rootPos,
             const int enemyLoss =
               std::max(0, initialEnemyMaterial - material_value(pos, them));
             const int investment = std::max(0, engineLoss - enemyLoss);
-            const int pressureGain =
-              std::max(0, positional_pressure(pos, engine) - initialPressure);
+            const int pressureGain = positional_style(pos, engine) - initialPressure;
+            const int legalReplies =
+              pos.checkers() ? 32 : int(MoveList<LEGAL>(pos).size());
+            const int restriction = std::max(0, 32 - legalReplies);
 
             const int sharedMaterialLoss = std::min(engineLoss, enemyLoss);
             const int materialLossGap     = std::abs(engineLoss - enemyLoss);
@@ -215,6 +229,8 @@ bool analyze_aggression_pv(const Position& rootPos,
               std::max(metrics.peakPressureGain, pressureGain);
             metrics.persistentPressureGain = pressureGain;
             metrics.pressureGainSum += pressureGain;
+            metrics.persistentRestriction = restriction;
+            metrics.restrictionSum += restriction;
             ++metrics.engineSamples;
         }
 
@@ -234,11 +250,60 @@ bool analyze_aggression_pv(const Position& rootPos,
     return true;
 }
 
+void clear_aggression_plan(SearchManager& manager) {
+    manager.aggressionPlanKeys.fill(0);
+    manager.aggressionPlanMoves.fill(Move::none());
+}
+
+Move planned_aggressive_move(const Position& rootPos, const SearchManager& manager) {
+    for (usize i = 0; i < SearchManager::AggressionPlanLength; ++i)
+        if (manager.aggressionPlanKeys[i] == rootPos.key())
+            return manager.aggressionPlanMoves[i];
+
+    return Move::none();
+}
+
+void remember_aggression_plan(const Position& rootPos,
+                              const PVMoves&  pv,
+                              SearchManager&  manager) {
+    clear_aggression_plan(manager);
+
+    Position  pos;
+    StateInfo rootState;
+    if (pos.set(rootPos.fen(), rootPos.is_chess960(), &rootState))
+        return;
+
+    const Color engine = pos.side_to_move();
+    std::array<StateInfo, AGGRESSION_PV_PLIES> states;
+    const usize plies = std::min(AGGRESSION_PV_PLIES, pv.size());
+    usize       planIndex = 0;
+
+    for (usize ply = 0; ply < plies; ++ply)
+    {
+        const Move move = pv[ply];
+        if (!move.is_ok() || !pos.pseudo_legal(move) || !pos.legal(move))
+            return;
+
+        // At future engine-to-move positions remember the next move of the chosen
+        // plan. A different opponent reply naturally produces a different key.
+        if (ply && pos.side_to_move() == engine
+            && planIndex < SearchManager::AggressionPlanLength)
+        {
+            manager.aggressionPlanKeys[planIndex]  = pos.key();
+            manager.aggressionPlanMoves[planIndex] = move;
+            ++planIndex;
+        }
+
+        pos.do_move(move, states[ply]);
+    }
+}
+
 Move select_aggressive_move(const Position& rootPos,
                             const RootMoves& rootMoves,
                             usize            candidateCount,
                             int              evalFloor,
-                            int              maxEvalDrop) {
+                            int              maxEvalDrop,
+                            Move             plannedMove) {
     const Move stockfishMove = rootMoves[0].pv[0];
     candidateCount           = std::min(candidateCount, rootMoves.size());
 
@@ -260,6 +325,15 @@ Move select_aggressive_move(const Position& rootPos,
         return stockfishMove;
 
     const int topScoreCp = UCIEngine::to_cp(topScore, rootPos);
+    constexpr int riskScaleRange = AGGRESSION_RISK_FULL_CP - AGGRESSION_RISK_START_CP;
+    const int riskScale =
+      std::clamp(topScoreCp - AGGRESSION_RISK_START_CP, 0, riskScaleRange);
+    // Near equality spend half of the configured drop; grow to one and a half
+    // times that budget by +6.00. The absolute floor remains a hard backstop.
+    const int allowedDropCp =
+      topScoreCp > evalFloor
+        ? maxEvalDrop / 2 + maxEvalDrop * riskScale / riskScaleRange
+        : maxEvalDrop;
     Move      selected   = stockfishMove;
     int       bestAggressionScore = -VALUE_INFINITE;
     Value     bestObjectiveScore  = -VALUE_INFINITE;
@@ -273,9 +347,11 @@ Move select_aggressive_move(const Position& rootPos,
             || rootMove.score_is_bound() || is_loss(rootMove.score))
             continue;
 
-        const int scoreCp = UCIEngine::to_cp(rootMove.score, rootPos);
-        if ((topScoreCp > evalFloor && scoreCp < evalFloor)
-            || (topScoreCp <= evalFloor && topScoreCp - scoreCp > maxEvalDrop))
+        const int scoreCp    = UCIEngine::to_cp(rootMove.score, rootPos);
+        const int evalDropCp = std::max(0, topScoreCp - scoreCp);
+        if ((topScoreCp > evalFloor
+             && (scoreCp < evalFloor || evalDropCp > allowedDropCp))
+            || (topScoreCp <= evalFloor && evalDropCp > allowedDropCp))
             continue;
 
         AggressionMetrics metrics;
@@ -286,7 +362,6 @@ Move select_aggressive_move(const Position& rootPos,
           metrics.investmentSum / std::max(1, metrics.engineSamples);
         const int sustainedInvestment =
           (2 * metrics.persistentInvestment + averageInvestment) / 3;
-        const int evalDropCp = std::max(0, topScoreCp - scoreCp);
         const int objectiveDropMaterial = evalDropCp * int(PawnValue) / 100;
 
         // If a PV remains materially invested deep into the line while retaining
@@ -308,7 +383,12 @@ Move select_aggressive_move(const Position& rootPos,
           (metrics.peakPressureGain + 2 * metrics.persistentPressureGain
            + averagePressure)
           / 4;
-        const int pressureReward = sustainedPressure * int(PawnValue) / 24;
+        const int averageRestriction =
+          metrics.restrictionSum / std::max(1, metrics.engineSamples);
+        const int sustainedRestriction =
+          (2 * metrics.persistentRestriction + averageRestriction) / 3;
+        const int pressureReward     = sustainedPressure * int(PawnValue) / 24;
+        const int restrictionReward = sustainedRestriction * int(PawnValue) / 48;
 
         // Truly unsupported loss keeps only one fifth of its peak value. A checking
         // sacrifice still receives full credit, as does a deeply sustained sacrifice
@@ -316,15 +396,15 @@ Move select_aggressive_move(const Position& rootPos,
         int aggressionScore =
           std::max({metrics.peakInvestment / 5, positionalSupport, offeredSupport,
                     metrics.checkingInvestment})
-          + pressureReward;
+          + pressureReward + restrictionReward;
         if (offeredInvestment && rootPos.gives_check(rootMove.pv[0]))
             aggressionScore = std::max(aggressionScore, offeredInvestment);
 
+        if (rootMove.pv[0] == plannedMove)
+            aggressionScore += AGGRESSION_PLAN_BONUS;
+
         // A large advantage is practical risk budget. Spend up to 1.5 pawns of it,
         // but only on a move which already has a concrete aggressive feature.
-        constexpr int riskScaleRange = AGGRESSION_RISK_FULL_CP - AGGRESSION_RISK_START_CP;
-        const int riskScale =
-          std::clamp(topScoreCp - AGGRESSION_RISK_START_CP, 0, riskScaleRange);
         if (aggressionScore > 0)
         {
             const int rewardedDropCp = std::min(evalDropCp, AGGRESSION_RISK_DROP_CP);
@@ -915,18 +995,32 @@ bool Search::Worker::iterative_deepening() {
     // Aggressive mode deliberately takes precedence over Skill Level's random choice.
     if (aggressiveMode)
     {
+        SearchManager& aggressionManager = *main_manager();
+        const Move     stockfishMove = rootMoves[0].pv[0];
+        const Move     plannedMove   = planned_aggressive_move(rootPos, aggressionManager);
         Move aggressiveMove = select_aggressive_move(rootPos, rootMoves, multiPV,
                                                      int(options["Aggression Eval Floor"]),
-                                                     int(options["Aggression Max Eval Drop"]));
+                                                     int(options["Aggression Max Eval Drop"]),
+                                                     plannedMove);
         auto selected = std::find(rootMoves.begin(), rootMoves.end(), aggressiveMove);
         if (selected != rootMoves.end())
             std::swap(rootMoves[0], *selected);
+
+        if (aggressiveMove != stockfishMove || aggressiveMove == plannedMove)
+            remember_aggression_plan(rootPos, rootMoves[0].pv, aggressionManager);
+        else
+            clear_aggression_plan(aggressionManager);
     }
-    // If the skill level is enabled, swap the best PV line with the sub-optimal one.
-    else if (skill.enabled())
-        std::swap(rootMoves[0],
-                  *std::find(rootMoves.begin(), rootMoves.end(),
-                             skill.best ? skill.best : skill.pick_best(rootMoves, multiPV)));
+    else
+    {
+        clear_aggression_plan(*main_manager());
+
+        // If the skill level is enabled, swap the best PV line with the sub-optimal one.
+        if (skill.enabled())
+            std::swap(rootMoves[0],
+                      *std::find(rootMoves.begin(), rootMoves.end(),
+                                 skill.best ? skill.best : skill.pick_best(rootMoves, multiPV)));
+    }
 
     return uciPvSent;
 }
@@ -975,6 +1069,9 @@ void Search::Worker::undo_null_move(Position& pos) { pos.undo_null_move(); }
 
 // Reset histories, usually before a new game
 void Search::Worker::clear() {
+    if (is_mainthread())
+        clear_aggression_plan(*main_manager());
+
     mainHistory.fill(-5);
     captureHistory.fill(-742);
 
