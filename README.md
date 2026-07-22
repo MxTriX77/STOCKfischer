@@ -1,6 +1,7 @@
-# STOCKfischer
+i'ts bascially a small Stockfish fork that adds an optional root-level “Aggressive Mode” rather than changing the core search or NNUE evaluation.
 
-So yeah, this is basically a clone/fork of original Stockfish, because apparently normal Stockfish was not angry enough.
-Idea was simple: look at a few good moves, allow some eval to evaporate, then pick the sacrifice or pressure move that makes the board look like a drunk spider designed it.
-Then i realized Stockfish loves material and clean winning lines way too much, so i vibe coded a selector that gets more reckless when ahead but still tries not to play actual garbage.
-Same fish brain, less fear, more chaos, probably dont use it for anything serious lol.
+When enabled, it forces MultiPV analysis of several candidate moves and reranks them using handcrafted signals such as material investment, king pressure, piece activity, and avoidance of simplifying exchanges.
+
+
+
+The current implementation may sacrifice substantial objective evaluation for style, particularly because its default admissibility threshold is based on an absolute −3.00 floor instead of a consistently relative evaluation loss.
