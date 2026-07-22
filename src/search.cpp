@@ -73,10 +73,10 @@ constexpr int SEARCHEDLIST_CAPACITY = 32;
 using SearchedList                  = ValueList<Move, SEARCHEDLIST_CAPACITY>;
 
 constexpr usize AGGRESSION_PV_PLIES      = 32;
-constexpr int   AGGRESSION_RISK_START_CP = 200;
-constexpr int   AGGRESSION_RISK_FULL_CP  = 600;
-constexpr int   AGGRESSION_RISK_DROP_CP  = 150;
+constexpr usize AGGRESSION_SEED_COUNT     = 8;
+constexpr int   AGGRESSION_RISK_DROP_CP  = 350;
 constexpr int   AGGRESSION_PLAN_BONUS     = 3 * int(PawnValue) / 4;
+constexpr int   AGGRESSION_MIN_NONTOP_SCORE = int(PawnValue) / 6;
 
 int material_value(const Position& pos, Color c) {
     return PawnValue * pos.count<PAWN>(c) + pos.non_pawn_material(c);
@@ -103,6 +103,100 @@ int root_move_investment(const Position& pos, Move move) {
     }
 
     return -lower;
+}
+
+int king_flank(File file) {
+    return file <= FILE_C ? -1 : file >= FILE_F ? 1 : 0;
+}
+
+int pawn_storm_score(const Position& pos, Color engine) {
+    const Color  them          = ~engine;
+    const File   enemyKingFile = file_of(pos.square<KING>(them));
+    const int    ownFlank      = king_flank(file_of(pos.square<KING>(engine)));
+    const int    enemyFlank    = king_flank(enemyKingFile);
+    const int    flankScale    = ownFlank && enemyFlank && ownFlank != enemyFlank ? 2 : 1;
+    int          score         = 0;
+    Bitboard     pawns         = pos.pieces(engine, PAWN);
+
+    while (pawns)
+    {
+        const Square square   = pop_lsb(pawns);
+        const int    distance = std::abs(int(file_of(square)) - int(enemyKingFile));
+        const int    advance = std::max(0, int(relative_rank(engine, square)) - int(RANK_2));
+        if (distance <= 2)
+            score += flankScale * (3 - distance) * advance;
+    }
+
+    return score;
+}
+
+int central_break_score(const Position& pos, Color engine) {
+    constexpr Bitboard broadCenter =
+      (FileCBB | FileDBB | FileEBB | FileFBB) & (Rank3BB | Rank4BB | Rank5BB | Rank6BB);
+    constexpr Bitboard centralFiles = FileDBB | FileEBB;
+
+    const Color    them        = ~engine;
+    const Bitboard pawnAttacks = pos.attacks_by<PAWN>(engine);
+    const Bitboard advancedCentralPawns =
+      pos.pieces(engine, PAWN) & centralFiles
+      & (engine == WHITE ? Rank4BB | Rank5BB | Rank6BB : Rank3BB | Rank4BB | Rank5BB);
+
+    return 3 * popcount(pawnAttacks & broadCenter)
+         + 6 * popcount(pawnAttacks & pos.pieces(them, PAWN) & broadCenter)
+         + 4 * popcount(advancedCentralPawns);
+}
+
+int open_king_lines_score(const Position& pos, Color engine) {
+    const Color    them          = ~engine;
+    const File     enemyKingFile = file_of(pos.square<KING>(them));
+    const Bitboard allPawns      = pos.pieces(PAWN);
+    const Bitboard heavyAttacks =
+      pos.attacks_by<ROOK>(engine) | pos.attacks_by<QUEEN>(engine);
+    int score = 0;
+
+    for (int file = std::max(0, int(enemyKingFile) - 1);
+         file <= std::min(int(FILE_H), int(enemyKingFile) + 1); ++file)
+    {
+        const Bitboard fileMask = file_bb(File(file));
+        if (!(pos.pieces(them, PAWN) & fileMask))
+            score += 3;
+        if (!(allPawns & fileMask))
+            score += 4;
+        score += 2 * popcount(heavyAttacks & fileMask);
+    }
+
+    return score;
+}
+
+int development_tempo_score(const Position& pos, Color engine) {
+    const Bitboard homeMinors =
+      engine == WHITE ? square_bb(SQ_B1) | SQ_C1 | SQ_F1 | SQ_G1
+                      : square_bb(SQ_B8) | SQ_C8 | SQ_F8 | SQ_G8;
+    const Bitboard activeMinors = pos.pieces(engine, KNIGHT, BISHOP) & ~homeMinors;
+    const Bitboard minorAttacks =
+      pos.attacks_by<KNIGHT>(engine) | pos.attacks_by<BISHOP>(engine);
+    const Bitboard valuableTargets = pos.pieces(~engine, KNIGHT, BISHOP, ROOK, QUEEN);
+
+    return 3 * popcount(activeMinors) + 5 * popcount(minorAttacks & valuableTargets);
+}
+
+int pawn_asymmetry_score(const Position& pos) {
+    int score = 0;
+    for (File file = FILE_A; file <= FILE_H; ++file)
+    {
+        const Bitboard fileMask = file_bb(file);
+        const int whitePawns = popcount(pos.pieces(WHITE, PAWN) & fileMask);
+        const int blackPawns = popcount(pos.pieces(BLACK, PAWN) & fileMask);
+        score += std::abs(whitePawns - blackPawns);
+        score += bool(whitePawns) != bool(blackPawns);
+    }
+    return score;
+}
+
+int phase_aggression(const Position& pos, Color engine) {
+    return 4 * pawn_storm_score(pos, engine) + 3 * central_break_score(pos, engine)
+         + 4 * open_king_lines_score(pos, engine) + 3 * development_tempo_score(pos, engine)
+         + 2 * pawn_asymmetry_score(pos);
 }
 
 int positional_pressure(const Position& pos, Color engine) {
@@ -149,6 +243,132 @@ int positional_style(const Position& pos, Color engine) {
     return (3 * positional_pressure(pos, engine) - positional_pressure(pos, ~engine)) / 2;
 }
 
+int aggressive_seed_score(const Position& rootPos, Move move) {
+    const Color     engine    = rootPos.side_to_move();
+    const PieceType movedType = type_of(rootPos.moved_piece(move));
+    const int       investment = root_move_investment(rootPos, move);
+    int             score      = 2 * investment;
+
+    if (rootPos.gives_check(move))
+        score += 2 * int(PawnValue);
+
+    if (movedType == PAWN)
+    {
+        const int advance = int(relative_rank(engine, move.to_sq()))
+                          - int(relative_rank(engine, move.from_sq()));
+        const int kingFileDistance =
+          std::abs(int(file_of(move.to_sq())) - int(file_of(rootPos.square<KING>(~engine))));
+        score += 24 * std::max(0, advance);
+        if (kingFileDistance <= 2)
+            score += 24 * (3 - kingFileDistance) * std::max(0, advance);
+        if (file_of(move.to_sq()) == FILE_D || file_of(move.to_sq()) == FILE_E)
+            score += 40;
+        if (rootPos.capture_stage(move))
+            score += 32;
+    }
+    else if ((movedType == ROOK || movedType == QUEEN)
+             && relative_rank(engine, move.to_sq()) >= RANK_3)
+        score += 48;
+
+    if (movedType == KNIGHT || movedType == BISHOP)
+    {
+        const Bitboard homeRank = engine == WHITE ? Rank1BB : Rank8BB;
+        if (square_bb(move.from_sq()) & homeRank)
+            score += 36;
+    }
+
+    Position  pos;
+    StateInfo rootState, moveState;
+    if (pos.set(rootPos.fen(), rootPos.is_chess960(), &rootState))
+        return score;
+
+    const int initialStyle = positional_style(pos, engine);
+    const int initialPhase = phase_aggression(pos, engine);
+    pos.do_move(move, moveState);
+
+    score += 4 * std::max(0, positional_style(pos, engine) - initialStyle);
+    score += 3 * std::max(0, phase_aggression(pos, engine) - initialPhase);
+
+    if (move.type_of() == CASTLING)
+    {
+        const int ownFlank   = king_flank(file_of(pos.square<KING>(engine)));
+        const int enemyFlank = king_flank(file_of(pos.square<KING>(~engine)));
+        if (ownFlank && enemyFlank && ownFlank != enemyFlank)
+            score += int(PawnValue);
+    }
+
+    return score;
+}
+
+PVMoves find_aggressive_seeds(const Position& rootPos,
+                              const RootMoves& rootMoves,
+                              usize            seedCount) {
+    std::vector<std::pair<int, Move>> scoredMoves;
+    scoredMoves.reserve(rootMoves.size());
+
+    for (const RootMove& rootMove : rootMoves)
+    {
+        const Move move  = rootMove.pv[0];
+        const int  score = aggressive_seed_score(rootPos, move);
+        if (score > 0)
+            scoredMoves.emplace_back(score, move);
+    }
+
+    std::stable_sort(scoredMoves.begin(), scoredMoves.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first > rhs.first;
+    });
+
+    PVMoves seeds;
+    for (usize i = 0; i < std::min(seedCount, scoredMoves.size()); ++i)
+        seeds.push_back(scoredMoves[i].second);
+    return seeds;
+}
+
+bool is_aggressive_seed(const PVMoves& seeds, Move move) {
+    return std::find(seeds.begin(), seeds.end(), move) != seeds.end();
+}
+
+void promote_aggressive_seeds(RootMoves& rootMoves, const PVMoves& seeds, usize multiPV) {
+    if (seeds.empty() || !multiPV || rootMoves.empty())
+        return;
+
+    // Tablebase ranks must remain grouped; decisive tablebase positions do not need
+    // speculative candidate injection anyway.
+    if (std::any_of(rootMoves.begin(), rootMoves.end(), [&](const RootMove& rootMove) {
+            return rootMove.tbRank != rootMoves[0].tbRank;
+        }))
+        return;
+
+    PVMoves desired;
+    const usize objectiveSlots = multiPV > seeds.size() ? multiPV - seeds.size() : 0;
+
+    for (const RootMove& rootMove : rootMoves)
+    {
+        if (desired.size() >= objectiveSlots)
+            break;
+        desired.push_back(rootMove.pv[0]);
+    }
+
+    for (Move seed : seeds)
+        if (std::find(desired.begin(), desired.end(), seed) == desired.end())
+            desired.push_back(seed);
+
+    for (const RootMove& rootMove : rootMoves)
+    {
+        if (desired.size() >= multiPV)
+            break;
+        if (std::find(desired.begin(), desired.end(), rootMove.pv[0]) == desired.end())
+            desired.push_back(rootMove.pv[0]);
+    }
+
+    for (usize i = 0; i < desired.size(); ++i)
+    {
+        auto found = std::find(rootMoves.begin() + i, rootMoves.end(), desired[i]);
+        if (found != rootMoves.end())
+            std::rotate(rootMoves.begin() + i, found, found + 1);
+    }
+}
+
 struct AggressionMetrics {
     int peakInvestment          = 0;
     int persistentInvestment    = 0;
@@ -161,7 +381,12 @@ struct AggressionMetrics {
     int balancedNonPawnExchange  = 0;
     int persistentRestriction    = 0;
     int restrictionSum           = 0;
+    int peakPhaseGain            = 0;
+    int persistentPhaseGain      = 0;
+    int phaseGainSum             = 0;
+    int queenTrade               = 0;
     int engineSamples           = 0;
+    bool repetition             = false;
 };
 
 bool analyze_aggression_pv(const Position& rootPos,
@@ -180,10 +405,13 @@ bool analyze_aggression_pv(const Position& rootPos,
     const int initialEnemyMaterial  = material_value(pos, them);
     const int initialEngineNonPawn  = pos.non_pawn_material(engine);
     const int initialEnemyNonPawn   = pos.non_pawn_material(them);
+    const int initialEngineQueens   = pos.count<QUEEN>(engine);
+    const int initialEnemyQueens    = pos.count<QUEEN>(them);
 
     std::array<StateInfo, AGGRESSION_PV_PLIES> states;
     const usize plies = std::min(AGGRESSION_PV_PLIES, pv.size());
     const int   initialPressure = positional_style(pos, engine);
+    const int   initialPhase    = phase_aggression(pos, engine);
     int         lastEngineCheckPly = -3;
 
     for (usize ply = 0; ply < plies; ++ply)
@@ -198,6 +426,8 @@ bool analyze_aggression_pv(const Position& rootPos,
             lastEngineCheckPly = int(ply);
 
         pos.do_move(move, states[ply]);
+        if (pos.is_repetition(int(ply) + 1))
+            metrics.repetition = true;
 
         // Only confirm an investment after the engine has had a move to answer the
         // opponent's capture. This avoids treating a truncated PV as a sacrifice.
@@ -209,9 +439,13 @@ bool analyze_aggression_pv(const Position& rootPos,
               std::max(0, initialEnemyMaterial - material_value(pos, them));
             const int investment = std::max(0, engineLoss - enemyLoss);
             const int pressureGain = positional_style(pos, engine) - initialPressure;
-            const int legalReplies =
-              pos.checkers() ? 32 : int(MoveList<LEGAL>(pos).size());
+            const int phaseGain    = phase_aggression(pos, engine) - initialPhase;
+            const int legalReplies = int(MoveList<LEGAL>(pos).size());
             const int restriction = std::max(0, 32 - legalReplies);
+            const int engineQueenLoss =
+              std::max(0, initialEngineQueens - pos.count<QUEEN>(engine));
+            const int enemyQueenLoss =
+              std::max(0, initialEnemyQueens - pos.count<QUEEN>(them));
 
             const int sharedMaterialLoss = std::min(engineLoss, enemyLoss);
             const int materialLossGap     = std::abs(engineLoss - enemyLoss);
@@ -231,6 +465,12 @@ bool analyze_aggression_pv(const Position& rootPos,
             metrics.pressureGainSum += pressureGain;
             metrics.persistentRestriction = restriction;
             metrics.restrictionSum += restriction;
+            metrics.peakPhaseGain = std::max(metrics.peakPhaseGain, phaseGain);
+            metrics.persistentPhaseGain = phaseGain;
+            metrics.phaseGainSum += phaseGain;
+            metrics.queenTrade =
+              std::max(metrics.queenTrade,
+                       std::min(engineQueenLoss, enemyQueenLoss) * int(QueenValue));
             ++metrics.engineSamples;
         }
 
@@ -325,18 +565,19 @@ Move select_aggressive_move(const Position& rootPos,
         return stockfishMove;
 
     const int topScoreCp = UCIEngine::to_cp(topScore, rootPos);
-    constexpr int riskScaleRange = AGGRESSION_RISK_FULL_CP - AGGRESSION_RISK_START_CP;
-    const int riskScale =
-      std::clamp(topScoreCp - AGGRESSION_RISK_START_CP, 0, riskScaleRange);
-    // Near equality spend half of the configured drop; grow to one and a half
-    // times that budget by +6.00. The absolute floor remains a hard backstop.
-    const int allowedDropCp =
-      topScoreCp > evalFloor
-        ? maxEvalDrop / 2 + maxEvalDrop * riskScale / riskScaleRange
-        : maxEvalDrop;
-    Move      selected   = stockfishMove;
-    int       bestAggressionScore = -VALUE_INFINITE;
-    Value     bestObjectiveScore  = -VALUE_INFINITE;
+    const int phaseDropLimit =
+      topScoreCp < 0
+        ? 250
+        : topScoreCp >= 300 ? 350 : 200 + std::max(0, topScoreCp) / 2;
+    const int allowedDropCp = std::min(maxEvalDrop, phaseDropLimit);
+
+    Move  selected                = stockfishMove;
+    int   bestAggressionScore     = -VALUE_INFINITE;
+    Value bestObjectiveScore      = -VALUE_INFINITE;
+    Move  bestNonTopMove          = Move::none();
+    int   bestNonTopScore         = -VALUE_INFINITE;
+    Value bestNonTopObjective     = -VALUE_INFINITE;
+    int   stockfishAggressionScore = -VALUE_INFINITE;
 
     for (usize i = 0; i < candidateCount; ++i)
     {
@@ -349,9 +590,7 @@ Move select_aggressive_move(const Position& rootPos,
 
         const int scoreCp    = UCIEngine::to_cp(rootMove.score, rootPos);
         const int evalDropCp = std::max(0, topScoreCp - scoreCp);
-        if ((topScoreCp > evalFloor
-             && (scoreCp < evalFloor || evalDropCp > allowedDropCp))
-            || (topScoreCp <= evalFloor && evalDropCp > allowedDropCp))
+        if (scoreCp < evalFloor || evalDropCp > allowedDropCp)
             continue;
 
         AggressionMetrics metrics;
@@ -389,6 +628,12 @@ Move select_aggressive_move(const Position& rootPos,
           (2 * metrics.persistentRestriction + averageRestriction) / 3;
         const int pressureReward     = sustainedPressure * int(PawnValue) / 24;
         const int restrictionReward = sustainedRestriction * int(PawnValue) / 48;
+        const int averagePhase = metrics.phaseGainSum / std::max(1, metrics.engineSamples);
+        const int sustainedPhase =
+          (metrics.peakPhaseGain + 2 * metrics.persistentPhaseGain + averagePhase) / 4;
+        int phaseReward = sustainedPhase * int(PawnValue) / 32;
+        if (rootPos.game_ply() < 24)
+            phaseReward = 3 * phaseReward / 2;
 
         // Truly unsupported loss keeps only one fifth of its peak value. A checking
         // sacrifice still receives full credit, as does a deeply sustained sacrifice
@@ -396,21 +641,30 @@ Move select_aggressive_move(const Position& rootPos,
         int aggressionScore =
           std::max({metrics.peakInvestment / 5, positionalSupport, offeredSupport,
                     metrics.checkingInvestment})
-          + pressureReward + restrictionReward;
+          + pressureReward + restrictionReward + phaseReward;
         if (offeredInvestment && rootPos.gives_check(rootMove.pv[0]))
             aggressionScore = std::max(aggressionScore, offeredInvestment);
 
         if (rootMove.pv[0] == plannedMove)
             aggressionScore += AGGRESSION_PLAN_BONUS;
 
-        // A large advantage is practical risk budget. Spend up to 1.5 pawns of it,
-        // but only on a move which already has a concrete aggressive feature.
+        // Once a move has real aggressive content, using the available risk budget is
+        // itself desirable. The appetite is already bounded by allowedDropCp above.
         if (aggressionScore > 0)
         {
             const int rewardedDropCp = std::min(evalDropCp, AGGRESSION_RISK_DROP_CP);
-            aggressionScore +=
-              rewardedDropCp * int(PawnValue) / 100 * riskScale / riskScaleRange;
+            const int riskAppetite =
+              topScoreCp < 0 ? 70 : topScoreCp >= 300 ? 100 : 70 + topScoreCp / 10;
+            aggressionScore += rewardedDropCp * int(PawnValue) / 100 * riskAppetite / 100;
         }
+
+        // Resist sterile play from equality onward, not only when the game is already
+        // won or lost. Queen trades and repetitions are intentionally expensive.
+        aggressionScore -= metrics.balancedMaterialExchange / 4;
+        aggressionScore -= metrics.balancedNonPawnExchange / 4;
+        aggressionScore -= 3 * metrics.queenTrade / 4;
+        if (metrics.repetition)
+            aggressionScore -= 3 * int(PawnValue);
 
         // When objectively worse, exchanging equal non-pawn material generally helps
         // the opponent simplify. Scale that penalty from two to five pawns down.
@@ -418,9 +672,20 @@ Move select_aggressive_move(const Position& rootPos,
         const int simplificationScale = std::min(deficitPastTwoPawns, 300);
         aggressionScore -= metrics.balancedNonPawnExchange * simplificationScale / 300;
 
-        // When winning, keep complexity instead of liquidating the advantage.
-        aggressionScore -=
-          metrics.balancedMaterialExchange * riskScale / (2 * riskScaleRange);
+        // When winning, increase the existing anti-liquidation pressure further.
+        const int winningScale = std::clamp(topScoreCp, 0, 600);
+        aggressionScore -= metrics.balancedMaterialExchange * winningScale / 2400;
+
+        if (rootMove.pv[0] == stockfishMove)
+            stockfishAggressionScore = aggressionScore;
+        else if (aggressionScore > bestNonTopScore
+                 || (aggressionScore == bestNonTopScore
+                     && rootMove.score > bestNonTopObjective))
+        {
+            bestNonTopMove      = rootMove.pv[0];
+            bestNonTopScore     = aggressionScore;
+            bestNonTopObjective = rootMove.score;
+        }
 
         if (aggressionScore > bestAggressionScore
             || (aggressionScore == bestAggressionScore
@@ -431,6 +696,15 @@ Move select_aggressive_move(const Position& rootPos,
             bestObjectiveScore  = rootMove.score;
         }
     }
+
+    // A merely objective top move is not allowed to win by inertia. Prefer a concrete,
+    // admissible non-top plan unless top-1 is itself decisively more aggressive.
+    const bool stockfishClearlyAggressive =
+      stockfishAggressionScore >= int(PawnValue)
+      && stockfishAggressionScore >= bestNonTopScore + int(PawnValue) / 4;
+    if (bestNonTopMove.is_ok() && bestNonTopScore >= AGGRESSION_MIN_NONTOP_SCORE
+        && !stockfishClearlyAggressive)
+        return bestNonTopMove;
 
     return selected;
 }
@@ -639,6 +913,7 @@ bool Search::Worker::iterative_deepening() {
     PVMoves lastBestMovePV;
     Depth   lastBestMoveDepth = 0;
     Value   lastBestMoveScore = -VALUE_INFINITE;
+    RootMoves aggressionSnapshot;
 
     Value  alpha, beta;
     Value  bestValue     = -VALUE_INFINITE;
@@ -690,6 +965,11 @@ bool Search::Worker::iterative_deepening() {
 
     multiPV = std::min(multiPV, rootMoves.size());
 
+    PVMoves aggressiveSeeds;
+    if (aggressiveMode)
+        aggressiveSeeds = find_aggressive_seeds(
+          rootPos, rootMoves, std::min(AGGRESSION_SEED_COUNT, multiPV / 2));
+
     int  searchAgainCounter = 0;
     bool uciPvSent          = false;
 
@@ -711,6 +991,9 @@ bool Search::Worker::iterative_deepening() {
             totBestMoveChanges /= 2;
             uciPvSent = false;
         }
+
+        if (aggressiveMode)
+            promote_aggressive_seeds(rootMoves, aggressiveSeeds, multiPV);
 
         // Save the last iteration's scores before the first PV line is searched and
         // all the move scores except the (new) PV are set to -VALUE_INFINITE.
@@ -761,7 +1044,11 @@ bool Search::Worker::iterative_deepening() {
                 // Adjust the effective depth searched, but ensure at least one
                 // effective increment for every four searchAgain steps (see issue #2717).
                 Depth adjustedDepth =
-                  std::max(1, rootDepth - failedHighCnt - 3 * (searchAgainCounter + 1) / 4);
+                  std::max(1, rootDepth
+                                + int(aggressiveMode
+                                      && is_aggressive_seed(aggressiveSeeds,
+                                                            rootMoves[pvIdx].pv[0]))
+                                - failedHighCnt - 3 * (searchAgainCounter + 1) / 4);
                 rootDelta = beta - alpha;
                 bestValue = search<Root>(rootPos, ss, alpha, beta, adjustedDepth, false);
 
@@ -871,6 +1158,11 @@ bool Search::Worker::iterative_deepening() {
             if (threads.stop)
                 break;
         }
+
+        // Preserve only fully completed MultiPV data. If time expires partway through
+        // the next iteration, aggressive selection still uses exact lines and scores.
+        if (mainThread && aggressiveMode && !threads.stop)
+            aggressionSnapshot = rootMoves;
 
         const bool forgottenMate = lastBestMoveScore != -VALUE_INFINITE
                                 && is_mate_or_mated(lastBestMoveScore)
@@ -996,18 +1288,29 @@ bool Search::Worker::iterative_deepening() {
     if (aggressiveMode)
     {
         SearchManager& aggressionManager = *main_manager();
-        const Move     stockfishMove = rootMoves[0].pv[0];
+        const RootMoves& selectionMoves =
+          aggressionSnapshot.empty() ? rootMoves : aggressionSnapshot;
+        const usize selectionCount = std::min(multiPV, selectionMoves.size());
+        const Move  stockfishMove = selectionMoves[0].pv[0];
         const Move     plannedMove   = planned_aggressive_move(rootPos, aggressionManager);
-        Move aggressiveMove = select_aggressive_move(rootPos, rootMoves, multiPV,
+        Move aggressiveMove = select_aggressive_move(rootPos, selectionMoves, selectionCount,
                                                      int(options["Aggression Eval Floor"]),
                                                      int(options["Aggression Max Eval Drop"]),
                                                      plannedMove);
+        auto snapshotSelected =
+          std::find(selectionMoves.begin(), selectionMoves.end(), aggressiveMove);
+        const PVMoves selectedPV =
+          snapshotSelected != selectionMoves.end() ? snapshotSelected->pv : rootMoves[0].pv;
         auto selected = std::find(rootMoves.begin(), rootMoves.end(), aggressiveMove);
         if (selected != rootMoves.end())
+        {
+            if (!aggressionSnapshot.empty() && snapshotSelected != selectionMoves.end())
+                *selected = *snapshotSelected;
             std::swap(rootMoves[0], *selected);
+        }
 
         if (aggressiveMove != stockfishMove || aggressiveMove == plannedMove)
-            remember_aggression_plan(rootPos, rootMoves[0].pv, aggressionManager);
+            remember_aggression_plan(rootPos, selectedPV, aggressionManager);
         else
             clear_aggression_plan(aggressionManager);
     }

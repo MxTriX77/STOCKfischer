@@ -104,10 +104,10 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
 
     options.add(  //
       "MultiPV", Option(1, 1, MAX_MOVES));
-    options.add("Aggressive Mode", Option(false));
-    options.add("Aggression Candidates", Option(8, 2, 16));
-    options.add("Aggression Eval Floor", Option(-300, -1000, 0));
-    options.add("Aggression Max Eval Drop", Option(100, 0, 500));
+    options.add("Aggressive Mode", Option(true));
+    options.add("Aggression Candidates", Option(16, 8, 24));
+    options.add("Aggression Eval Floor", Option(-1000, -3000, 0));
+    options.add("Aggression Max Eval Drop", Option(350, 0, 1000));
     options.add("Skill Level", Option(20, 0, 20));
 
     options.add("Move Overhead", Option(10, 0, 5000));
