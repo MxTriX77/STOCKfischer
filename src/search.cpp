@@ -74,8 +74,7 @@ using SearchedList                  = ValueList<Move, SEARCHEDLIST_CAPACITY>;
 
 constexpr usize AGGRESSION_PV_PLIES      = 32;
 constexpr usize AGGRESSION_SEED_COUNT     = 8;
-constexpr int   AGGRESSION_RISK_DROP_CP  = 350;
-constexpr int   AGGRESSION_PLAN_BONUS     = 3 * int(PawnValue) / 4;
+constexpr int   AGGRESSION_PLAN_BONUS     = int(PawnValue) / 4;
 constexpr int   AGGRESSION_MIN_NONTOP_SCORE = int(PawnValue) / 6;
 
 int material_value(const Position& pos, Color c) {
@@ -197,6 +196,41 @@ int phase_aggression(const Position& pos, Color engine) {
     return 4 * pawn_storm_score(pos, engine) + 3 * central_break_score(pos, engine)
          + 4 * open_king_lines_score(pos, engine) + 3 * development_tempo_score(pos, engine)
          + 2 * pawn_asymmetry_score(pos);
+}
+
+int positional_pressure(const Position& pos, Color engine);
+
+int aggression_opportunity(const Position& pos, Color engine) {
+    const Color them = ~engine;
+    int score = 0;
+
+    // Aggression has more room to be sound while the queens and attacking material
+    // remain, but material alone is not permission to throw pieces away.
+    if (pos.count<QUEEN>(engine) && pos.count<QUEEN>(them))
+        score += 15;
+    score += std::min(10, (pos.non_pawn_material(engine) + pos.non_pawn_material(them))
+                           / (4 * int(PawnValue)));
+
+    const int attackingPhase = 3 * pawn_storm_score(pos, engine)
+                             + 2 * central_break_score(pos, engine)
+                             + 3 * open_king_lines_score(pos, engine);
+    score += std::clamp(attackingPhase / 12, 0, 35);
+
+    const int pressureEdge = positional_pressure(pos, engine)
+                           - positional_pressure(pos, them) / 2;
+    score += std::clamp(pressureEdge / 6, 0, 25);
+
+    Bitboard enemyKingZone =
+      Attacks::attacks_bb<KING>(pos.square<KING>(them)) | pos.square<KING>(them);
+    const int shelterPawns = popcount(enemyKingZone & pos.pieces(them, PAWN));
+    score += 6 * std::max(0, 3 - shelterPawns);
+
+    const int ownFlank   = king_flank(file_of(pos.square<KING>(engine)));
+    const int enemyFlank = king_flank(file_of(pos.square<KING>(them)));
+    if (ownFlank && enemyFlank && ownFlank != enemyFlank)
+        score += 15;
+
+    return std::clamp(score, 0, 100);
 }
 
 int positional_pressure(const Position& pos, Color engine) {
@@ -385,6 +419,7 @@ struct AggressionMetrics {
     int persistentPhaseGain      = 0;
     int phaseGainSum             = 0;
     int queenTrade               = 0;
+    int rootPieceShufflePenalty  = 0;
     int engineSamples           = 0;
     bool repetition             = false;
 };
@@ -413,6 +448,8 @@ bool analyze_aggression_pv(const Position& rootPos,
     const int   initialPressure = positional_style(pos, engine);
     const int   initialPhase    = phase_aggression(pos, engine);
     int         lastEngineCheckPly = -3;
+    Square      rootPieceOrigin = SQ_NONE;
+    Square      rootPieceSquare = SQ_NONE;
 
     for (usize ply = 0; ply < plies; ++ply)
     {
@@ -424,6 +461,30 @@ bool analyze_aggression_pv(const Position& rootPos,
 
         if (engineMove && pos.gives_check(move))
             lastEngineCheckPly = int(ply);
+
+        if (engineMove && !ply)
+        {
+            rootPieceOrigin = move.from_sq();
+            rootPieceSquare = move.to_sq();
+        }
+        else if (engineMove && move.from_sq() == rootPieceSquare)
+        {
+            const bool forcing = pos.gives_check(move) || pos.capture_stage(move)
+                              || move.type_of() == PROMOTION;
+            if (!forcing)
+            {
+                const bool pieceIsAttacked =
+                  bool(pos.attackers_to(move.from_sq()) & pos.pieces(them));
+                metrics.rootPieceShufflePenalty +=
+                  pieceIsAttacked ? int(PawnValue) / 8 : 3 * int(PawnValue) / 4;
+                if (move.to_sq() == rootPieceOrigin)
+                    metrics.rootPieceShufflePenalty +=
+                      pieceIsAttacked ? int(PawnValue) / 2 : 2 * int(PawnValue);
+            }
+            rootPieceSquare = move.to_sq();
+        }
+        else if (!engineMove && pos.capture_stage(move) && move.to_sq() == rootPieceSquare)
+            rootPieceSquare = SQ_NONE;
 
         pos.do_move(move, states[ply]);
         if (pos.is_repetition(int(ply) + 1))
@@ -490,9 +551,247 @@ bool analyze_aggression_pv(const Position& rootPos,
     return true;
 }
 
+bool exact_root_score(const RootMove& rootMove) {
+    return !rootMove.pv.empty() && rootMove.score != VALUE_NONE
+        && rootMove.score != -VALUE_INFINITE && rootMove.score != VALUE_INFINITE
+        && !rootMove.score_is_bound();
+}
+
+Value objective_top_score(const RootMoves& rootMoves, usize candidateCount) {
+    Value topScore = -VALUE_INFINITE;
+    candidateCount = std::min(candidateCount, rootMoves.size());
+
+    for (usize i = 0; i < candidateCount; ++i)
+        if (exact_root_score(rootMoves[i]))
+            topScore = std::max(topScore, rootMoves[i].score);
+
+    return topScore;
+}
+
+Move select_stylish_mate(const Position& rootPos,
+                         const RootMoves& rootMoves,
+                         usize            candidateCount) {
+    candidateCount = std::min(candidateCount, rootMoves.size());
+    Value fastestMate = -VALUE_INFINITE;
+
+    for (usize i = 0; i < candidateCount; ++i)
+        if (exact_root_score(rootMoves[i]) && is_mate(rootMoves[i].score))
+            fastestMate = std::max(fastestMate, rootMoves[i].score);
+
+    if (fastestMate == -VALUE_INFINITE)
+        return Move::none();
+
+    Move  selected       = Move::none();
+    int   bestStyle      = -VALUE_INFINITE;
+    Value selectedMate   = -VALUE_INFINITE;
+
+    for (usize i = 0; i < candidateCount; ++i)
+    {
+        const RootMove& rootMove = rootMoves[i];
+        if (!exact_root_score(rootMove) || rootMove.score != fastestMate)
+            continue;
+
+        AggressionMetrics metrics;
+        if (!analyze_aggression_pv(rootPos, rootMove.pv, metrics))
+            continue;
+
+        int style = 2 * metrics.checkingInvestment + metrics.peakInvestment
+                  + metrics.peakPressureGain * int(PawnValue) / 16
+                  + metrics.peakPhaseGain * int(PawnValue) / 24;
+        if (rootPos.gives_check(rootMove.pv[0]))
+            style += 2 * int(PawnValue);
+
+        if (style > bestStyle || (style == bestStyle && rootMove.score > selectedMate))
+        {
+            selected     = rootMove.pv[0];
+            bestStyle    = style;
+            selectedMate = rootMove.score;
+        }
+    }
+
+    // Style only breaks ties among equally fast exact mates. If PV reconstruction
+    // failed, fall back to the first shortest mate without delaying the finish.
+    if (selected.is_ok())
+        return selected;
+    for (usize i = 0; i < candidateCount; ++i)
+        if (exact_root_score(rootMoves[i]) && rootMoves[i].score == fastestMate)
+            return rootMoves[i].pv[0];
+
+    return Move::none();
+}
+
+Move current_decisive_move(const Position& rootPos,
+                           const RootMoves& rootMoves,
+                           usize            candidateCount) {
+    if (Move mateMove = select_stylish_mate(rootPos, rootMoves, candidateCount);
+        mateMove.is_ok())
+        return mateMove;
+
+    if (!rootMoves.empty() && exact_root_score(rootMoves[0])
+        && is_decisive(rootMoves[0].score))
+        return rootMoves[0].pv[0];
+
+    return Move::none();
+}
+
 void clear_aggression_plan(SearchManager& manager) {
     manager.aggressionPlanKeys.fill(0);
     manager.aggressionPlanMoves.fill(Move::none());
+}
+
+void clear_aggression_risk(SearchManager& manager) {
+    manager.aggressionRiskDebtCp   = 0;
+    manager.lastAggressiveObjectiveCp = 0;
+    manager.hasAggressiveObjective = false;
+}
+
+void clear_aggression_history(SearchManager& manager) {
+    manager.lastAggressiveMove     = Move::none();
+    manager.previousAggressiveMove = Move::none();
+    manager.lastAggressiveGamePly  = -1;
+    manager.lastAggressiveSide     = WHITE;
+    manager.aggressionPostMovePositions.fill({});
+    clear_aggression_risk(manager);
+}
+
+void clear_aggression_state(SearchManager& manager) {
+    clear_aggression_plan(manager);
+    clear_aggression_history(manager);
+}
+
+void remember_aggressive_move(const Position& rootPos, Move move, SearchManager& manager) {
+    const bool continuesGame = manager.lastAggressiveMove.is_ok()
+                            && manager.lastAggressiveSide == rootPos.side_to_move()
+                            && manager.lastAggressiveGamePly + 2 == rootPos.game_ply();
+
+    manager.previousAggressiveMove =
+      continuesGame ? manager.lastAggressiveMove : Move::none();
+
+    if (!continuesGame)
+        manager.aggressionPostMovePositions.fill({});
+    else
+        for (usize i = manager.aggressionPostMovePositions.size() - 1; i; --i)
+            manager.aggressionPostMovePositions[i] =
+              manager.aggressionPostMovePositions[i - 1];
+
+    Position  pos;
+    StateInfo rootState, moveState;
+    if (!pos.set(rootPos.fen(), rootPos.is_chess960(), &rootState) && move.is_ok()
+        && pos.pseudo_legal(move) && pos.legal(move))
+    {
+        pos.do_move(move, moveState);
+        std::string fen = pos.fen();
+        usize       end = 0;
+        for (int field = 0; field < 4; ++field)
+        {
+            end = fen.find(' ', end);
+            if (end == std::string::npos)
+                break;
+            ++end;
+        }
+        manager.aggressionPostMovePositions[0] =
+          end == std::string::npos ? fen : fen.substr(0, end - 1);
+    }
+
+    manager.lastAggressiveMove    = move;
+    manager.lastAggressiveGamePly = rootPos.game_ply();
+    manager.lastAggressiveSide    = rootPos.side_to_move();
+}
+
+bool repeats_recent_aggressive_position(
+  const Position&                       rootPos,
+  Move                                  move,
+  const std::array<std::string, 4>& recentPositions) {
+    if (std::all_of(recentPositions.begin(), recentPositions.end(),
+                    [](const std::string& position) { return position.empty(); }))
+        return false;
+
+    Position  pos;
+    StateInfo rootState, moveState;
+    if (pos.set(rootPos.fen(), rootPos.is_chess960(), &rootState) || !move.is_ok()
+        || !pos.pseudo_legal(move) || !pos.legal(move))
+        return false;
+
+    pos.do_move(move, moveState);
+    std::string fen = pos.fen();
+    usize       end = 0;
+    for (int field = 0; field < 4; ++field)
+    {
+        end = fen.find(' ', end);
+        if (end == std::string::npos)
+            break;
+        ++end;
+    }
+    const std::string identity = end == std::string::npos ? fen : fen.substr(0, end - 1);
+    return std::find(recentPositions.begin(), recentPositions.end(), identity)
+        != recentPositions.end();
+}
+
+void recent_aggressive_moves(const Position& rootPos,
+                             const SearchManager& manager,
+                             Move&                lastMove,
+                             Move&                previousMove) {
+    const bool continuesGame = manager.lastAggressiveMove.is_ok()
+                            && manager.lastAggressiveSide == rootPos.side_to_move()
+                            && manager.lastAggressiveGamePly + 2 == rootPos.game_ply();
+    lastMove     = continuesGame ? manager.lastAggressiveMove : Move::none();
+    previousMove = continuesGame ? manager.previousAggressiveMove : Move::none();
+}
+
+int current_aggression_risk_debt(const Position& rootPos,
+                                 int             topScoreCp,
+                                 const SearchManager& manager) {
+    const bool continuesGame = manager.lastAggressiveMove.is_ok()
+                            && manager.lastAggressiveSide == rootPos.side_to_move()
+                            && manager.lastAggressiveGamePly + 2 == rootPos.game_ply()
+                            && manager.hasAggressiveObjective;
+    if (!continuesGame)
+        return 0;
+
+    // Improvement beyond the score expected after our previous move represents
+    // value gained from the opponent's reply. That replenishes the style budget.
+    // Ignore small search-to-search evaluation noise. The account is replenished
+    // only when the opponent gives us a meaningful objective improvement.
+    const int recoveredCp =
+      std::max(0, topScoreCp - manager.lastAggressiveObjectiveCp - 25);
+    return std::max(0, manager.aggressionRiskDebtCp - recoveredCp);
+}
+
+void remember_aggression_risk(int topScoreCp,
+                              int selectedScoreCp,
+                              int previousDebtCp,
+                              SearchManager& manager) {
+    manager.aggressionRiskDebtCp =
+      previousDebtCp + std::max(0, topScoreCp - selectedScoreCp);
+    manager.lastAggressiveObjectiveCp = selectedScoreCp;
+    manager.hasAggressiveObjective    = true;
+}
+
+int repeated_piece_penalty(const Position& rootPos,
+                           Move            move,
+                           Move            lastMove,
+                           Move            previousMove) {
+    if (!lastMove.is_ok() || move.from_sq() != lastMove.to_sq())
+        return 0;
+
+    // Checks, captures and promotions are concrete tactics, not purposeless shuffling.
+    if (rootPos.gives_check(move) || rootPos.capture_stage(move)
+        || move.type_of() == PROMOTION)
+        return 0;
+
+    const Color engine = rootPos.side_to_move();
+    const bool pieceIsAttacked =
+      bool(rootPos.attackers_to(move.from_sq()) & rootPos.pieces(~engine));
+    int penalty = pieceIsAttacked ? int(PawnValue) / 8 : 3 * int(PawnValue) / 4;
+
+    // Moving straight back is especially suspicious. Also catch a three-turn tour
+    // which returns the piece all the way to the square from which it first developed.
+    if (move.to_sq() == lastMove.from_sq())
+        penalty += pieceIsAttacked ? int(PawnValue) / 2 : 2 * int(PawnValue);
+    if (previousMove.is_ok() && move.to_sq() == previousMove.from_sq())
+        penalty += int(PawnValue);
+
+    return penalty;
 }
 
 Move planned_aggressive_move(const Position& rootPos, const SearchManager& manager) {
@@ -543,7 +842,11 @@ Move select_aggressive_move(const Position& rootPos,
                             usize            candidateCount,
                             int              evalFloor,
                             int              maxEvalDrop,
-                            Move             plannedMove) {
+                            Move             plannedMove,
+                            Move             lastMove,
+                            Move             previousMove,
+                            int              riskDebtCp,
+                            const std::array<std::string, 4>& recentPositions) {
     const Move stockfishMove = rootMoves[0].pv[0];
     candidateCount           = std::min(candidateCount, rootMoves.size());
 
@@ -552,32 +855,27 @@ Move select_aggressive_move(const Position& rootPos,
         && stockfishScore != VALUE_INFINITE && is_decisive(stockfishScore))
         return stockfishMove;
 
-    Value topScore = -VALUE_INFINITE;
-    for (usize i = 0; i < candidateCount; ++i)
-    {
-        const RootMove& rootMove = rootMoves[i];
-        if (rootMove.score != VALUE_NONE && rootMove.score != -VALUE_INFINITE
-            && rootMove.score != VALUE_INFINITE && !rootMove.score_is_bound())
-            topScore = std::max(topScore, rootMove.score);
-    }
+    const Value topScore = objective_top_score(rootMoves, candidateCount);
 
     if (topScore == -VALUE_INFINITE || is_decisive(topScore))
         return stockfishMove;
 
     const int topScoreCp = UCIEngine::to_cp(topScore, rootPos);
-    const int phaseDropLimit =
-      topScoreCp < 0
-        ? 250
-        : topScoreCp >= 300 ? 350 : 200 + std::max(0, topScoreCp) / 2;
-    const int allowedDropCp = std::min(maxEvalDrop, phaseDropLimit);
+    const int opportunity = aggression_opportunity(rootPos, rootPos.side_to_move());
+    const int baseRiskReserveCp =
+      topScoreCp >= 600 ? 150 + opportunity / 2
+      : topScoreCp >= 300 ? 120 + opportunity / 2
+      : topScoreCp >= 100 ? 90 + opportunity / 2
+      : topScoreCp >= 0 ? 45 + opportunity / 4
+      : topScoreCp >= -100 ? 25 + opportunity / 5
+      : topScoreCp >= -200 ? 15 + opportunity / 6
+                           : 10 + opportunity / 8;
 
-    Move  selected                = stockfishMove;
-    int   bestAggressionScore     = -VALUE_INFINITE;
-    Value bestObjectiveScore      = -VALUE_INFINITE;
     Move  bestNonTopMove          = Move::none();
     int   bestNonTopScore         = -VALUE_INFINITE;
     Value bestNonTopObjective     = -VALUE_INFINITE;
     int   stockfishAggressionScore = -VALUE_INFINITE;
+    bool  stockfishRepeats         = false;
 
     for (usize i = 0; i < candidateCount; ++i)
     {
@@ -590,7 +888,7 @@ Move select_aggressive_move(const Position& rootPos,
 
         const int scoreCp    = UCIEngine::to_cp(rootMove.score, rootPos);
         const int evalDropCp = std::max(0, topScoreCp - scoreCp);
-        if (scoreCp < evalFloor || evalDropCp > allowedDropCp)
+        if (topScoreCp > evalFloor && scoreCp < evalFloor)
             continue;
 
         AggressionMetrics metrics;
@@ -645,18 +943,32 @@ Move select_aggressive_move(const Position& rootPos,
         if (offeredInvestment && rootPos.gives_check(rootMove.pv[0]))
             aggressionScore = std::max(aggressionScore, offeredInvestment);
 
+        // A quiet position receives only a narrow risk budget. Concrete pressure or
+        // a supported sacrifice can earn more freedom, up to the user's hard limit.
+        const int tacticalJustification =
+          std::max({0, positionalSupport, offeredSupport, metrics.checkingInvestment});
+        if (topScoreCp < -150 && tacticalJustification < int(PawnValue) / 4)
+            continue;
+        const int justificationBonusCp =
+          std::clamp(tacticalJustification * 100 / int(PawnValue), 0, 140);
+        const int candidateRiskReserveCp =
+          std::min(maxEvalDrop, baseRiskReserveCp + justificationBonusCp);
+        const int allowedDropCp =
+          std::max(0, candidateRiskReserveCp - riskDebtCp);
+        if (evalDropCp > allowedDropCp)
+            continue;
+
+        const bool repeatsRecent = repeats_recent_aggressive_position(
+          rootPos, rootMove.pv[0], recentPositions);
+        if (repeatsRecent && rootMove.pv[0] != stockfishMove)
+            continue;
+
         if (rootMove.pv[0] == plannedMove)
             aggressionScore += AGGRESSION_PLAN_BONUS;
 
-        // Once a move has real aggressive content, using the available risk budget is
-        // itself desirable. The appetite is already bounded by allowedDropCp above.
-        if (aggressionScore > 0)
-        {
-            const int rewardedDropCp = std::min(evalDropCp, AGGRESSION_RISK_DROP_CP);
-            const int riskAppetite =
-              topScoreCp < 0 ? 70 : topScoreCp >= 300 ? 100 : 70 + topScoreCp / 10;
-            aggressionScore += rewardedDropCp * int(PawnValue) / 100 * riskAppetite / 100;
-        }
+        aggressionScore -=
+          repeated_piece_penalty(rootPos, rootMove.pv[0], lastMove, previousMove);
+        aggressionScore -= metrics.rootPieceShufflePenalty;
 
         // Resist sterile play from equality onward, not only when the game is already
         // won or lost. Queen trades and repetitions are intentionally expensive.
@@ -677,7 +989,10 @@ Move select_aggressive_move(const Position& rootPos,
         aggressionScore -= metrics.balancedMaterialExchange * winningScale / 2400;
 
         if (rootMove.pv[0] == stockfishMove)
+        {
             stockfishAggressionScore = aggressionScore;
+            stockfishRepeats         = repeatsRecent;
+        }
         else if (aggressionScore > bestNonTopScore
                  || (aggressionScore == bestNonTopScore
                      && rootMove.score > bestNonTopObjective))
@@ -687,26 +1002,29 @@ Move select_aggressive_move(const Position& rootPos,
             bestNonTopObjective = rootMove.score;
         }
 
-        if (aggressionScore > bestAggressionScore
-            || (aggressionScore == bestAggressionScore
-                && rootMove.score > bestObjectiveScore))
-        {
-            selected            = rootMove.pv[0];
-            bestAggressionScore = aggressionScore;
-            bestObjectiveScore  = rootMove.score;
-        }
     }
 
-    // A merely objective top move is not allowed to win by inertia. Prefer a concrete,
-    // admissible non-top plan unless top-1 is itself decisively more aggressive.
+    // A non-top move now has to earn the deviation. In a quiet position it needs a
+    // substantially stronger positional case; in a genuine attack the threshold falls.
+    const int nonTopThreshold = AGGRESSION_MIN_NONTOP_SCORE
+                              + (100 - opportunity) * int(PawnValue) / 100
+                              + std::clamp(-topScoreCp, 0, 300) * int(PawnValue) / 300;
+    const int requiredLead = int(PawnValue) / 4
+                           + std::max(0, 70 - opportunity) * int(PawnValue) / 50
+                           + std::clamp(-topScoreCp, 0, 200) * int(PawnValue) / 200;
     const bool stockfishClearlyAggressive =
       stockfishAggressionScore >= int(PawnValue)
       && stockfishAggressionScore >= bestNonTopScore + int(PawnValue) / 4;
-    if (bestNonTopMove.is_ok() && bestNonTopScore >= AGGRESSION_MIN_NONTOP_SCORE
-        && !stockfishClearlyAggressive)
+    const bool escapesRepetition =
+      stockfishRepeats && bestNonTopMove.is_ok() && bestNonTopScore >= 0;
+    if (bestNonTopMove.is_ok()
+        && ((bestNonTopScore >= nonTopThreshold
+             && bestNonTopScore >= stockfishAggressionScore + requiredLead
+             && !stockfishClearlyAggressive)
+            || escapesRepetition))
         return bestNonTopMove;
 
-    return selected;
+    return stockfishMove;
 }
 
 // (*Scalers):
@@ -1288,23 +1606,49 @@ bool Search::Worker::iterative_deepening() {
     if (aggressiveMode)
     {
         SearchManager& aggressionManager = *main_manager();
-        const RootMoves& selectionMoves =
-          aggressionSnapshot.empty() ? rootMoves : aggressionSnapshot;
-        const usize selectionCount = std::min(multiPV, selectionMoves.size());
-        const Move  stockfishMove = selectionMoves[0].pv[0];
-        const Move     plannedMove   = planned_aggressive_move(rootPos, aggressionManager);
-        Move aggressiveMove = select_aggressive_move(rootPos, selectionMoves, selectionCount,
-                                                     int(options["Aggression Eval Floor"]),
-                                                     int(options["Aggression Max Eval Drop"]),
-                                                     plannedMove);
+        const RootMoves* selectionMoves =
+          aggressionSnapshot.empty() ? &rootMoves : &aggressionSnapshot;
+        usize selectionCount = std::min(multiPV, selectionMoves->size());
+        Move decisiveMove =
+          current_decisive_move(rootPos, rootMoves, std::min(multiPV, rootMoves.size()));
+        if (decisiveMove.is_ok())
+        {
+            // A newly found exact mate/TB result must not be hidden by an older
+            // completed-iteration snapshot.
+            selectionMoves = &rootMoves;
+            selectionCount = std::min(multiPV, rootMoves.size());
+        }
+
+        const Move stockfishMove = (*selectionMoves)[0].pv[0];
+        const Move plannedMove   = planned_aggressive_move(rootPos, aggressionManager);
+        Move       lastMove, previousMove;
+        recent_aggressive_moves(rootPos, aggressionManager, lastMove, previousMove);
+        const Value selectionTopScore = objective_top_score(*selectionMoves, selectionCount);
+        const int selectionTopScoreCp =
+          selectionTopScore == -VALUE_INFINITE || is_decisive(selectionTopScore)
+            ? 0
+            : UCIEngine::to_cp(selectionTopScore, rootPos);
+        const int riskDebtCp = decisiveMove.is_ok()
+                               ? 0
+                               : current_aggression_risk_debt(rootPos, selectionTopScoreCp,
+                                                              aggressionManager);
+        Move aggressiveMove =
+          decisiveMove.is_ok()
+            ? decisiveMove
+            : select_aggressive_move(rootPos, *selectionMoves, selectionCount,
+                                     int(options["Aggression Eval Floor"]),
+                                     int(options["Aggression Max Eval Drop"]), plannedMove,
+                                     lastMove, previousMove, riskDebtCp,
+                                     aggressionManager.aggressionPostMovePositions);
         auto snapshotSelected =
-          std::find(selectionMoves.begin(), selectionMoves.end(), aggressiveMove);
+          std::find(selectionMoves->begin(), selectionMoves->end(), aggressiveMove);
         const PVMoves selectedPV =
-          snapshotSelected != selectionMoves.end() ? snapshotSelected->pv : rootMoves[0].pv;
+          snapshotSelected != selectionMoves->end() ? snapshotSelected->pv : rootMoves[0].pv;
         auto selected = std::find(rootMoves.begin(), rootMoves.end(), aggressiveMove);
         if (selected != rootMoves.end())
         {
-            if (!aggressionSnapshot.empty() && snapshotSelected != selectionMoves.end())
+            if (selectionMoves == &aggressionSnapshot
+                && snapshotSelected != selectionMoves->end())
                 *selected = *snapshotSelected;
             std::swap(rootMoves[0], *selected);
         }
@@ -1313,10 +1657,21 @@ bool Search::Worker::iterative_deepening() {
             remember_aggression_plan(rootPos, selectedPV, aggressionManager);
         else
             clear_aggression_plan(aggressionManager);
+
+        if (!decisiveMove.is_ok() && selectionTopScore != -VALUE_INFINITE
+            && snapshotSelected != selectionMoves->end()
+            && exact_root_score(*snapshotSelected) && !is_decisive(snapshotSelected->score))
+            remember_aggression_risk(
+              selectionTopScoreCp, UCIEngine::to_cp(snapshotSelected->score, rootPos),
+              riskDebtCp, aggressionManager);
+        else
+            clear_aggression_risk(aggressionManager);
+
+        remember_aggressive_move(rootPos, aggressiveMove, aggressionManager);
     }
     else
     {
-        clear_aggression_plan(*main_manager());
+        clear_aggression_state(*main_manager());
 
         // If the skill level is enabled, swap the best PV line with the sub-optimal one.
         if (skill.enabled())
@@ -1373,7 +1728,7 @@ void Search::Worker::undo_null_move(Position& pos) { pos.undo_null_move(); }
 // Reset histories, usually before a new game
 void Search::Worker::clear() {
     if (is_mainthread())
-        clear_aggression_plan(*main_manager());
+        clear_aggression_state(*main_manager());
 
     mainHistory.fill(-5);
     captureHistory.fill(-742);
